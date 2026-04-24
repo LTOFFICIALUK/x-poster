@@ -1,0 +1,19 @@
+# Secrets — never commit these
+.env
+.env.local
+.env.*.local
+
+# Runtime files
+automation.log
+posted_urls.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+.venv/
+
+# OS
+.DS_Store
