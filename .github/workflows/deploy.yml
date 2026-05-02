@@ -1,0 +1,35 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy automations
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to Hetzner via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+
+            echo "→ Pulling latest code..."
+            cd /opt/teventis-automations
+            git pull origin main
+
+            echo "→ Installing/updating dependencies..."
+            ./venv/bin/pip install -q -r requirements.txt
+
+            echo "→ Restarting service..."
+            systemctl restart teventis-automations
+
+            echo "→ Checking service status..."
+            sleep 2
+            systemctl is-active teventis-automations && echo "✓ Service is running" || (journalctl -u teventis-automations -n 20 --no-pager && exit 1)
