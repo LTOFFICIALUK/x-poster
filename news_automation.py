@@ -3,7 +3,7 @@ News Automation — DB-driven runtime
 ====================================
 Fetches top world news, generates AI-powered neutral summaries, and posts to
 the platforms each client has configured. Every client-specific knob is loaded
-from Postgres at startup — there is nothing per-client in this file.
+from Postgres on every scheduler tick — there is nothing per-client in this file.
 
 What lives where:
     - Per-automation config + schedule_times + timezone + dry_run    → DB (automations, news_automation_configs)
@@ -501,19 +501,44 @@ def run_health_check(automations: list[Automation]) -> bool:
     return all_ok
 
 
+def _scheduler_poll_seconds() -> float:
+    raw = (os.environ.get("SCHEDULER_POLL_SECONDS") or "10").strip()
+    try:
+        sec = float(raw)
+    except ValueError:
+        sec = 10.0
+    return max(5.0, min(sec, 120.0))
+
+
 # ─── Scheduler (timezone-aware, multi-automation) ────────────────────────────
 
-def schedule_loop(automations: list[Automation]) -> None:
+def schedule_loop(*, type_filter: str = "news_posting") -> None:
     """
-    Polling scheduler. Every 30s, for each automation check whether the current
-    time-of-day in that automation's timezone matches one of its schedule_times,
-    and if it hasn't already fired today, run it.
+    Polling scheduler. On each tick (see SCHEDULER_POLL_SECONDS, default 10s),
+    reloads active automations from Postgres so schedule_times, timezone, and
+    credentials stay current without restarting the process. Then for each
+    automation, if local time (that automation's timezone) matches a
+    schedule_time and that slot has not fired today, runs the job.
     """
+    poll = _scheduler_poll_seconds()
     last_fired: dict[tuple[int, str], str] = defaultdict(str)
-    log.info("Scheduler started. Ctrl-C to stop.\n")
+    last_good: list[Automation] | None = None
+    log.info(
+        "Scheduler started (poll every %.0fs, reloads from DB each tick). Ctrl-C to stop.\n",
+        poll,
+    )
 
     while True:
         try:
+            try:
+                automations = load_active_automations(type_filter=type_filter)
+                last_good = automations
+            except Exception:
+                log.exception("Failed to reload automations from DB")
+                automations = last_good if last_good is not None else []
+                if not automations:
+                    log.warning("No automations in memory yet; waiting for a successful DB load.")
+
             for a in automations:
                 try:
                     tz = ZoneInfo(a.timezone)
@@ -527,13 +552,13 @@ def schedule_loop(automations: list[Automation]) -> None:
                     if current_hm == sched_time and last_fired[(a.id, sched_time)] != today:
                         last_fired[(a.id, sched_time)] = today
                         run_posting_job(a, trigger="scheduled")
-            time.sleep(30)
+            time.sleep(poll)
         except KeyboardInterrupt:
             log.info("Scheduler stopped by user.")
             return
         except Exception as e:
             log.exception(f"Scheduler loop error: {e}")
-            time.sleep(30)
+            time.sleep(poll)
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
@@ -555,7 +580,7 @@ def main() -> None:
 
     if not ok:
         log.warning("Health check failed; scheduler starting anyway.")
-    schedule_loop(automations)
+    schedule_loop(type_filter="news_posting")
 
 
 if __name__ == "__main__":
