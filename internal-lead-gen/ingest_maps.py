@@ -58,6 +58,51 @@ log = logging.getLogger(__name__)
 # When --max-new is set, stop after this many full list passes without enough new leads.
 _MAX_SHUFFLE_ROUNDS = 6
 
+# Must match `MAPS_INGEST_LOG_MESSAGE` in frontend-admin `@/lib/status.ts`.
+MAPS_INGEST_LOG_MESSAGE = "maps_ingest_run"
+
+
+def persist_maps_heartbeat(
+    database_url: str,
+    *,
+    dry_run: bool,
+    stats: dict[str, int],
+    error: str | None,
+    max_new_cli: int | None,
+    only_index_cli: int | None,
+) -> None:
+    """Append one logs row per run so admin system status reflects cron health."""
+    ctx: dict[str, Any] = {
+        "source": "maps_ingest",
+        "dry_run": dry_run,
+        "new": stats.get("new", 0),
+        "updated": stats.get("updated", 0),
+        "skip": stats.get("skip", 0),
+        "rows_seen": stats.get("rows_seen", 0),
+        "would_upsert": stats.get("would_upsert", 0),
+        "max_new": max_new_cli,
+        "only_index": only_index_cli,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if error:
+        ctx["error"] = error[:8000]
+
+    level = "error" if error else "info"
+    payload = json.dumps(ctx, default=str)
+
+    try:
+        with psycopg.connect(database_url) as wb, wb.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO logs (level, message, context)
+                VALUES (%s, %s, %s::jsonb)
+                """,
+                (level, MAPS_INGEST_LOG_MESSAGE, payload),
+            )
+            wb.commit()
+    except Exception as e:
+        log.warning("Could not persist maps ingest heartbeat: %s", e)
+
 
 def _build_metadata(row: dict[str, Any], target: SearchTarget, text_query: str) -> dict[str, Any]:
     return {
@@ -120,11 +165,9 @@ def run_ingest(
     max_new: int | None,
     api_key: str,
     database_url: str,
-) -> None:
+) -> dict[str, int]:
     targets = list(SEARCH_TARGETS)
     if only_index is not None:
-        if only_index < 0 or only_index >= len(targets):
-            raise SystemExit(f"--only-index must be 0..{len(targets) - 1}")
         targets = [targets[only_index]]
 
     stats: dict[str, int] = {
@@ -243,6 +286,7 @@ def run_ingest(
         stats["would_upsert"],
         dry_run,
     )
+    return dict(stats)
 
 
 def main() -> None:
@@ -273,13 +317,46 @@ def main() -> None:
         log.error("DATABASE_URL is required unless --dry-run")
         sys.exit(1)
 
-    run_ingest(
-        dry_run=args.dry_run,
-        only_index=args.only_index,
-        max_new=args.max_new,
-        api_key=api_key,
-        database_url=database_url,
-    )
+    if args.only_index is not None:
+        n = len(SEARCH_TARGETS)
+        if args.only_index < 0 or args.only_index >= n:
+            log.error("--only-index must be between 0 and %s", max(0, n - 1))
+            sys.exit(2)
+
+    stale_stats: dict[str, int] = {
+        "skip": 0,
+        "new": 0,
+        "updated": 0,
+        "rows_seen": 0,
+        "would_upsert": 0,
+    }
+    err_text: str | None = None
+    stats_result = stale_stats
+
+    try:
+        stats_result = run_ingest(
+            dry_run=args.dry_run,
+            only_index=args.only_index,
+            max_new=args.max_new,
+            api_key=api_key,
+            database_url=database_url,
+        )
+    except Exception as e:
+        err_text = f"{type(e).__name__}: {e}"
+        log.exception("Maps ingest failed")
+    finally:
+        if not args.dry_run and database_url.strip():
+            persist_maps_heartbeat(
+                database_url,
+                dry_run=args.dry_run,
+                stats=stats_result,
+                error=err_text,
+                max_new_cli=args.max_new,
+                only_index_cli=args.only_index,
+            )
+
+    if err_text:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
