@@ -294,15 +294,12 @@ def _post_instagram_official(text: str, sa: SocialAccount, automation: Automatio
         if not creation_id:
             return False, None, "no creation id from instagram /media"
 
-        publish_url = f"https://graph.facebook.com/v18.0/{account_id}/media_publish"
-        pr = requests.post(publish_url, params={
-            "creation_id":  creation_id,
-            "access_token": access_token,
-        })
-        pr.raise_for_status()
-        media_id = pr.json().get("id")
-        log.info(f"[{automation.client_slug}] Posted to Instagram (official, {media_id}).")
-        return True, str(media_id) if media_id else None, None
+        return _ig_wait_then_publish_creation(
+            account_id=str(account_id),
+            creation_id=str(creation_id),
+            access_token=access_token,
+            client_slug=automation.client_slug,
+        )
     except requests.HTTPError as e:
         body = e.response.text if e.response is not None else ""
         return False, None, f"{e} — {body}"
@@ -383,6 +380,91 @@ POSTERS = {
 }
 
 
+def _max_article_attempts_per_run() -> int:
+    raw = (os.environ.get("MAX_ARTICLE_ATTEMPTS_PER_RUN") or "3").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 3
+    return max(1, min(n, 15))
+
+
+def _ig_wait_then_publish_creation(
+    account_id: str,
+    creation_id: str,
+    access_token: str,
+    client_slug: str,
+    *,
+    poll_interval: float = 3.0,
+    poll_timeout: float = 120.0,
+    publish_retries: int = 6,
+    publish_sleep: float = 4.0,
+) -> tuple[bool, str | None, str | None]:
+    """
+    Instagram `/media` returns a container that is not instantly publishable.
+    Poll `status_code` until FINISHED (or bail on ERROR). Then POST `media_publish`,
+    retrying on Meta's transient 'not ready' (OAuth 9007 / subcode 2207027).
+    """
+    deadline = time.monotonic() + poll_timeout
+    status_url = f"https://graph.facebook.com/v18.0/{creation_id}"
+    while time.monotonic() < deadline:
+        st = requests.get(status_url, params={
+            "fields": "status_code",
+            "access_token": access_token,
+        }, timeout=30)
+        if st.status_code != 200:
+            return False, None, f"ig container status GET failed: {st.status_code} {st.text}"
+
+        payload = st.json()
+        status_code = payload.get("status_code")
+        if status_code == "FINISHED":
+            break
+        if status_code == "ERROR":
+            return False, None, (
+                "Instagram container STATUS_ERROR "
+                + str(payload.get("status") or payload)
+            )
+
+        log.info(
+            f"[{client_slug}] Instagram container {creation_id} status={status_code!r}; "
+            f"waiting {poll_interval:.0f}s",
+        )
+        time.sleep(poll_interval)
+    else:
+        return False, None, "Instagram container polling timed out without FINISHED"
+
+    publish_url = f"https://graph.facebook.com/v18.0/{account_id}/media_publish"
+
+    last_err: str | None = None
+    for attempt in range(publish_retries):
+        pr = requests.post(publish_url, params={
+            "creation_id":  creation_id,
+            "access_token": access_token,
+        }, timeout=60)
+        if pr.status_code == 200:
+            body = pr.json()
+            mid = body.get("id")
+            log.info(f"[{client_slug}] Posted to Instagram (official, {mid}).")
+            return True, str(mid) if mid else None, None
+
+        last_err = pr.text or str(pr.status_code)
+        transient = '"code":9007' in last_err or "Media ID is not available" in last_err or (
+            '"error_subcode":2207027' in last_err
+        )
+
+        if transient and attempt < publish_retries - 1:
+            log.info(
+                f"[{client_slug}] Instagram publish not ready (attempt "
+                f"{attempt + 1}/{publish_retries}), retry in {publish_sleep:.0f}s",
+            )
+            time.sleep(publish_sleep)
+            continue
+
+        break
+
+    return False, None, f"{pr.status_code} Client Error: Bad Request — {last_err}"
+
+
 # ─── Main posting job ────────────────────────────────────────────────────────
 
 def run_posting_job(automation: Automation, trigger: str = "scheduled") -> None:
@@ -399,60 +481,92 @@ def run_posting_job(automation: Automation, trigger: str = "scheduled") -> None:
                          notes="no candidate articles after filters")
             return
 
-        # Pick the freshest available article (newsapi orders by recency).
-        chosen = articles[0]
-        article_id = upsert_article(
-            automation_id=automation.id,
-            client_id=automation.client_id,
-            article=chosen,
-            selection_status="chosen",
-        )
+        max_attempts = _max_article_attempts_per_run()
+        candidates = articles[:max_attempts]
+        summary_title = ""
 
-        any_success = False
-        any_failure = False
-
-        for sa in automation.social_accounts:
-            poster = POSTERS.get(sa.platform)
-            if poster is None:
-                log.warning(f"[{automation.client_slug}] No poster for {sa.platform}, skipping.")
-                continue
-
-            text = generate_post(chosen, sa.platform, automation)
-            if text is None:
-                record_post(automation.id, automation.client_id, article_id,
-                            sa.platform, "failed", "",
-                            error_message="AI generation returned None")
-                any_failure = True
-                continue
-
-            ok, external_id, err = poster(text, sa, automation, chosen.get("urlToImage"))
-
-            record_post(
+        last_article_id: int | None = None
+        for attempt_no, chosen in enumerate(candidates, start=1):
+            article_id = upsert_article(
                 automation_id=automation.id,
                 client_id=automation.client_id,
-                article_id=article_id,
-                platform=sa.platform,
-                status="published" if ok else "failed",
-                generated_text=text,
-                external_id=external_id,
-                error_message=err,
+                article=chosen,
+                selection_status="chosen",
             )
+            last_article_id = article_id
+            summary_title = (chosen.get("title") or "")[:80]
 
-            if ok:
-                any_success = True
-            else:
-                any_failure = True
-                log.warning(f"[{automation.client_slug}] {sa.platform} failed: {err}")
+            any_success = False
+            any_failure = False
 
-            time.sleep(2)  # gentle pacing between platforms
+            for sa in automation.social_accounts:
+                poster = POSTERS.get(sa.platform)
+                if poster is None:
+                    log.warning(f"[{automation.client_slug}] No poster for {sa.platform}, skipping.")
+                    continue
 
-        status = "success" if any_success and not any_failure else \
-                 "partial" if any_success else "failed"
-        finalise_run(run_id, status=status,
-                     articles_considered=len(articles),
-                     article_id_chosen=article_id)
-        log.info(f"─── [{automation.client_slug}] Job complete ({status}) — "
-                 f"{(chosen.get('title') or '')[:80]} ───\n")
+                text = generate_post(chosen, sa.platform, automation)
+                if text is None:
+                    record_post(automation.id, automation.client_id, article_id,
+                                sa.platform, "failed", "",
+                                error_message="AI generation returned None")
+                    any_failure = True
+                    continue
+
+                ok, external_id, err = poster(text, sa, automation, chosen.get("urlToImage"))
+
+                record_post(
+                    automation_id=automation.id,
+                    client_id=automation.client_id,
+                    article_id=article_id,
+                    platform=sa.platform,
+                    status="published" if ok else "failed",
+                    generated_text=text,
+                    external_id=external_id,
+                    error_message=err,
+                )
+
+                if ok:
+                    any_success = True
+                else:
+                    any_failure = True
+                    log.warning(f"[{automation.client_slug}] {sa.platform} failed: {err}")
+
+                time.sleep(2)  # gentle pacing between platforms
+
+            if any_success and any_failure:
+                status = "partial"
+                finalise_run(run_id, status=status,
+                             articles_considered=len(articles),
+                             article_id_chosen=article_id)
+                log.info(f"─── [{automation.client_slug}] Job complete ({status}) — "
+                         f"{summary_title} ───\n")
+                return
+
+            if any_success and not any_failure:
+                finalise_run(run_id, status="success",
+                             articles_considered=len(articles),
+                             article_id_chosen=article_id)
+                log.info(f"─── [{automation.client_slug}] Job complete (success) — "
+                         f"{summary_title} ───\n")
+                return
+
+            total_fail_all_platforms = not any_success
+            remains = attempt_no < len(candidates)
+
+            if total_fail_all_platforms and remains:
+                log.warning(
+                    f"[{automation.client_slug}] Article {attempt_no}/{len(candidates)} failed on "
+                    f"every platform — trying next candidate.",
+                )
+                continue
+
+            finalise_run(run_id, status="failed",
+                         articles_considered=len(articles),
+                         article_id_chosen=article_id or last_article_id)
+            log.info(f"─── [{automation.client_slug}] Job complete (failed) — "
+                     f"{summary_title} ───\n")
+            return
 
     except Exception as e:
         log.exception(f"[{automation.client_slug}] Run crashed: {e}")
