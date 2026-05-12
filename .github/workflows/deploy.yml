@@ -20,16 +20,38 @@ jobs:
           script: |
             set -e
 
-            echo "→ Pulling latest code..."
+            echo "→ Ensuring TEVENTIS_SECRETS_KEY in server .env (from GitHub Actions secret)..."
             cd /opt/teventis-automations
+            touch .env
+            chmod 600 .env
+            if [ -z "${{ secrets.TEVENTIS_SECRETS_KEY }}" ]; then
+              echo "⚠️  Add repo secret TEVENTIS_SECRETS_KEY (same hex as local teventis-automations/.env) or set the key manually on the server."
+            else
+              grep -v '^TEVENTIS_SECRETS_KEY=' .env > .env.tmp || cp .env .env.tmp
+              mv .env.tmp .env
+              echo 'TEVENTIS_SECRETS_KEY=${{ secrets.TEVENTIS_SECRETS_KEY }}' >> .env
+              echo "✓ TEVENTIS_SECRETS_KEY refreshed in .env"
+            fi
+
+            echo "→ Pulling latest code..."
             git pull origin main
 
             echo "→ Installing/updating dependencies..."
             ./venv/bin/pip install -q -r requirements.txt
 
-            echo "→ Restarting service..."
+            echo "→ Restarting services..."
             systemctl restart teventis-automations
+            # teventis-telephony is optional — only restart if the unit is installed.
+            # First-time install: copy telephony-appointments/teventis-telephony.service
+            # into /etc/systemd/system/ and `systemctl enable teventis-telephony`.
+            systemctl is-enabled teventis-telephony >/dev/null 2>&1 \
+              && systemctl restart teventis-telephony \
+              && echo "✓ teventis-telephony restarted" \
+              || echo "ℹ teventis-telephony not enabled (skipping)"
 
             echo "→ Checking service status..."
             sleep 2
-            systemctl is-active teventis-automations && echo "✓ Service is running" || (journalctl -u teventis-automations -n 20 --no-pager && exit 1)
+            systemctl is-active teventis-automations && echo "✓ teventis-automations running" || (journalctl -u teventis-automations -n 20 --no-pager && exit 1)
+            systemctl is-enabled teventis-telephony >/dev/null 2>&1 && {
+              systemctl is-active teventis-telephony && echo "✓ teventis-telephony running" || (journalctl -u teventis-telephony -n 20 --no-pager && exit 1)
+            } || true
