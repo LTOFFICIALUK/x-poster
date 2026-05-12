@@ -1,0 +1,9 @@
+# telephony-appointments — additional Python deps on top of the parent
+# `teventis-automations/requirements.txt`. The systemd unit installs these
+# into the same venv used by news_automation.
+
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+httpx>=0.27.0          # already in parent, listed here for clarity
+python-dotenv>=1.0.0   # already in parent
+psycopg[binary]>=3.1.0 # already in parent

@@ -6,6 +6,7 @@
 # Runtime files
 automation.log
 posted_urls.json
+ig_session.json
 
 # Python
 __pycache__/

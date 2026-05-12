@@ -1,201 +1,171 @@
 """
-News Automation Script
-======================
-Fetches top world news articles, generates AI-powered neutral summaries,
-and posts to X (Twitter), LinkedIn, and Instagram on a schedule.
+News Automation — DB-driven runtime
+====================================
+Fetches top world news, generates AI-powered neutral summaries, and posts to
+the platforms each client has configured. Every client-specific knob is loaded
+from Postgres at startup — there is nothing per-client in this file.
+
+What lives where:
+    - Per-automation config + schedule_times + timezone + dry_run    → DB (automations, news_automation_configs)
+    - Per-client social handles, account IDs, IG mode, session paths → DB (social_accounts.platform_metadata)
+    - Per-client API keys / passwords / tokens                       → DB (social_account_credentials, encrypted)
+    - Article history / dedup                                        → DB (articles)
+    - Run + post history                                             → DB (runs, posts)
+    - AI model name / max_tokens                                      → hardcoded here (intentional — internal testing parity)
+    - NewsAPI + Anthropic API keys                                    → .env (shared across all clients)
 
 Author: Luke Carter — AI Automation Specialist
 """
 
+from __future__ import annotations
+
 import os
-import json
+import sys
 import time
-import random
 import logging
+import tempfile
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
-import schedule
+load_dotenv()  # must happen BEFORE importing automation_db (it reads env)
+
 import requests
+import tweepy
 from newsapi import NewsApiClient
 import anthropic
-import tweepy
 
-# ─── Setup ───────────────────────────────────────────────────────────────────
+import automation_db
+from automation_db import (
+    Automation,
+    SocialAccount,
+    load_active_automations,
+    create_run,
+    finalise_run,
+    upsert_article,
+    article_already_seen,
+    record_post,
+    log as db_log,
+)
 
-load_dotenv()
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler("automation.log"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+    ],
 )
 log = logging.getLogger(__name__)
 
-# ─── Config ───────────────────────────────────────────────────────────────────
 
-# News API (https://newsapi.org)
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+# ─── Hardcoded (deliberately) ────────────────────────────────────────────────
+# Per Luke: keep AI choice consistent across clients for internal testing parity.
+# When you want this to vary per client, move to news_automation_configs.
 
-# Anthropic (https://console.anthropic.com)
+AI_MODEL      = "claude-haiku-4-5-20251001"
+AI_MAX_TOKENS = 400
+
+
+# ─── Shared env (NOT per-client) ─────────────────────────────────────────────
+
+NEWS_API_KEY      = os.getenv("NEWS_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-# Twitter/X (https://developer.twitter.com)
-TWITTER_API_KEY        = os.getenv("TWITTER_API_KEY")
-TWITTER_API_SECRET     = os.getenv("TWITTER_API_SECRET")
-TWITTER_ACCESS_TOKEN   = os.getenv("TWITTER_ACCESS_TOKEN")
-TWITTER_ACCESS_SECRET  = os.getenv("TWITTER_ACCESS_SECRET")
-TWITTER_BEARER_TOKEN   = os.getenv("TWITTER_BEARER_TOKEN")
-
-# LinkedIn (https://www.linkedin.com/developers)
-LINKEDIN_ACCESS_TOKEN  = os.getenv("LINKEDIN_ACCESS_TOKEN")
-LINKEDIN_PERSON_URN    = os.getenv("LINKEDIN_PERSON_URN")  # e.g. "urn:li:person:ABC123"
-
-# Instagram (Meta Graph API — https://developers.facebook.com)
-INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")
-INSTAGRAM_ACCOUNT_ID   = os.getenv("INSTAGRAM_ACCOUNT_ID")
-
-# Posting config
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"  # Set to true to test without posting
-POSTS_PER_DAY = 3
-
-# ─── Persistent Deduplication ────────────────────────────────────────────────
-# Tracks posted article URLs across restarts so we never repost the same article
-
-POSTED_URLS_FILE = Path("posted_urls.json")
-
-def load_posted_urls() -> set:
-    if POSTED_URLS_FILE.exists():
-        try:
-            return set(json.loads(POSTED_URLS_FILE.read_text()))
-        except Exception:
-            return set()
-    return set()
-
-def save_posted_url(url: str):
-    urls = load_posted_urls()
-    urls.add(url)
-    # Keep last 500 URLs to prevent file growing indefinitely
-    trimmed = list(urls)[-500:]
-    POSTED_URLS_FILE.write_text(json.dumps(trimmed))
-
-ALREADY_POSTED = load_posted_urls()
-
-
-def is_configured(*keys: str) -> bool:
-    """Returns True only if all given env keys are set and not placeholder values."""
-    return all(
-        os.getenv(k) and not os.getenv(k, "").startswith("your_")
-        for k in keys
+if not NEWS_API_KEY or not ANTHROPIC_API_KEY:
+    raise SystemExit(
+        "NEWS_API_KEY and ANTHROPIC_API_KEY must be set in .env. "
+        "These two are global (shared across all clients)."
     )
 
 
-# ─── News Fetcher ─────────────────────────────────────────────────────────────
+# ─── News fetch ──────────────────────────────────────────────────────────────
 
-def fetch_top_news(max_articles: int = 10) -> list[dict]:
+def fetch_top_news(automation: Automation) -> list[dict]:
     """
-    Fetches top world news from neutral, internationally-focused sources only.
-    Sources: Reuters, AP, BBC News, Al Jazeera, France 24 — no domestic or entertainment outlets.
+    Fetch articles from NewsAPI using this automation's trusted_sources +
+    keyword filters, skipping anything already seen by this automation.
     """
-    newsapi = NewsApiClient(api_key=NEWS_API_KEY)
-
-    # Neutral, internationally-recognised sources only
-    TRUSTED_SOURCES = "reuters,associated-press,bbc-news,al-jazeera-english,france-24"
-
-    # Keywords that indicate entertainment, celebrity, or non-global content — skip these
-    EXCLUDE_KEYWORDS = [
-        "nfl", "nba", "celebrity", "box office", "kardashian", "oscars",
-        "republican", "democrat", "gop", "trump", "biden", "maga",
-        "reality tv", "breakfast show", "radio show", "tv show", "presenter",
-        "replaces", "sitcom", "album", "tour", "singer", "actor", "actress",
-        "film review", "movie review", "box office", "grammy", "bafta",
-        "premier league", "champions league", "formula 1", "grand prix",
-        "cricket", "rugby", "tennis", "golf"
-    ]
-
-    # At least one of these must appear for the article to qualify as world/global news
-    REQUIRE_KEYWORDS = [
-        "global", "international", "world", "united nations", "un ", "nato",
-        "war", "conflict", "peace", "climate", "summit", "treaty", "sanctions",
-        "crisis", "government", "president", "prime minister", "election",
-        "economy", "trade", "migration", "humanitarian", "nuclear", "diplomacy",
-        "protest", "military", "aid", "ceasefire", "refugee", "poverty"
-    ]
-
-    try:
-        response = newsapi.get_top_headlines(
-            sources=TRUSTED_SOURCES,
-            language="en",
-            page_size=max_articles * 2  # Fetch extra to account for filtering
-        )
-        articles = response.get("articles", [])
-
-        filtered = []
-        for a in articles:
-            title = a.get("title", "")
-            description = a.get("description", "")
-            combined = (title + " " + description).lower()
-
-            # Skip if missing key fields or already posted
-            if not (title and a.get("description") and a.get("url")):
-                continue
-            if title == "[Removed]" or a["url"] in ALREADY_POSTED:
-                continue
-            # Skip if matches any excluded keywords
-            if any(kw in combined for kw in EXCLUDE_KEYWORDS):
-                continue
-            # Skip if it doesn't contain at least one world/global news keyword
-            if not any(kw in combined for kw in REQUIRE_KEYWORDS):
-                continue
-
-            filtered.append(a)
-
-        result = filtered[:max_articles]
-        log.info(f"Fetched {len(result)} world news articles from trusted sources.")
-        return result
-
-    except Exception as e:
-        log.error(f"Failed to fetch news: {e}")
+    cfg = automation.config
+    if cfg is None:
         return []
 
+    page_size = max(min(cfg.max_articles_per_fetch, 100), 1)
+    sources   = ",".join(cfg.trusted_sources) if cfg.trusted_sources else None
 
-# ─── AI Summariser ────────────────────────────────────────────────────────────
+    try:
+        client = NewsApiClient(api_key=NEWS_API_KEY)
+        # If no trusted sources configured, fall back to top global headlines
+        # rather than failing. Admin should populate trusted_sources soon.
+        kwargs = {"language": "en", "page_size": page_size}
+        if sources:
+            kwargs["sources"] = sources
+        response = client.get_top_headlines(**kwargs)
+        articles = response.get("articles", [])
+    except Exception as e:
+        log.error(f"[{automation.client_slug}] NewsAPI fetch failed: {e}")
+        db_log("error", f"NewsAPI fetch failed: {e}",
+               automation_id=automation.id, client_id=automation.client_id)
+        return []
 
-def generate_post(article: dict, platform: str) -> str:
-    """
-    Uses Claude to generate a neutral, platform-appropriate post for the given article.
-    """
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    excludes = [k.lower() for k in cfg.exclude_keywords]
+    requires = [k.lower() for k in cfg.require_keywords]
+
+    filtered: list[dict] = []
+    for a in articles:
+        title = a.get("title") or ""
+        desc  = a.get("description") or ""
+        url   = a.get("url") or ""
+        if not (title and desc and url):
+            continue
+        if title == "[Removed]":
+            continue
+        if article_already_seen(automation.id, url):
+            continue
+
+        haystack = (title + " " + desc).lower()
+        if excludes and any(kw in haystack for kw in excludes):
+            continue
+        if requires and not any(kw in haystack for kw in requires):
+            continue
+
+        filtered.append(a)
+
+    log.info(f"[{automation.client_slug}] Fetched {len(filtered)} candidate articles "
+             f"(out of {len(articles)} from NewsAPI).")
+    return filtered
+
+
+# ─── AI post generation ──────────────────────────────────────────────────────
+
+def generate_post(article: dict, platform: str, automation: Automation) -> str | None:
+    """Use Claude to draft a neutral, platform-appropriate post."""
+    cfg = automation.config
+    if cfg is None:
+        return None
 
     title       = article.get("title", "")
     description = article.get("description", "")
-    source      = article.get("source", {}).get("name", "Unknown source")
+    source      = (article.get("source") or {}).get("name", "Unknown source")
     url         = article.get("url", "")
 
-    platform_instructions = {
-        "twitter": (
-            "Write a concise, neutral tweet (max 240 characters). "
-            "No hashtags unless they fit naturally. End with the article URL. "
-            "Do not editorialize — present the facts only."
-        ),
-        "linkedin": (
-            "Write a professional LinkedIn post (2-3 short paragraphs). "
-            "Neutral and factual tone. Include a brief one-sentence summary, "
-            "a key detail or stat from the description, and end with the article URL. "
-            "No clickbait or emotional language."
-        ),
-        "instagram": (
-            "Write an Instagram caption (2-4 sentences). "
-            "Neutral and informative. Add 5-8 relevant hashtags at the end (e.g. #WorldNews #GlobalAffairs). "
-            "End with the article URL."
-        ),
-    }
+    instructions = cfg.post_style_instructions.get(platform)
+    if not instructions:
+        log.warning(f"[{automation.client_slug}] No post_style_instructions for {platform} — "
+                    f"using a generic fallback.")
+        instructions = "Write a neutral, factual social post about this article. End with the URL."
 
-    instructions = platform_instructions.get(platform, platform_instructions["twitter"])
+    requirement_prompt = cfg.article_requirement_prompt or (
+        "You are a neutral world news summariser. Report facts only, no opinions, "
+        "no partisan framing, no emotionally charged language."
+    )
 
-    prompt = f"""You are a neutral world news summariser. Your job is to create social media posts about international news and global issues — without bias, opinion, partisan framing, or sensationalism. Do not take sides. Report facts only. Avoid emotionally charged language.
+    prompt = f"""{requirement_prompt}
 
 Article title: {title}
 Article description: {description}
@@ -207,299 +177,386 @@ URL: {url}
 Return only the post text. No preamble, no explanation."""
 
     try:
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg = client.messages.create(
+            model=AI_MODEL,
+            max_tokens=AI_MAX_TOKENS,
+            messages=[{"role": "user", "content": prompt}],
         )
-        post_text = message.content[0].text.strip()
-        log.info(f"Generated {platform} post for: {title[:60]}...\n{'-'*60}\n{post_text}\n{'-'*60}")
-        return post_text
-
+        text = msg.content[0].text.strip()
+        log.info(f"[{automation.client_slug}] Generated {platform} post for: {title[:60]}...")
+        return text
     except Exception as e:
-        log.error(f"Failed to generate post for {platform}: {e}")
+        log.error(f"[{automation.client_slug}] AI generation failed for {platform}: {e}")
+        db_log("error", f"AI generation failed for {platform}: {e}",
+               automation_id=automation.id, client_id=automation.client_id,
+               context={"platform": platform})
         return None
 
 
-# ─── Posters ──────────────────────────────────────────────────────────────────
+# ─── Posters ─────────────────────────────────────────────────────────────────
+# Each poster takes (text, social_account, automation, image_url).
+# They return (success: bool, external_id: str | None, error: str | None).
 
-def post_to_twitter(text: str) -> bool:
-    """Posts a tweet using the Twitter/X API v2 via Tweepy."""
-    if DRY_RUN:
-        log.info(f"[DRY RUN] Twitter post:\n{text}\n")
-        return True
+def post_to_twitter(text: str, sa: SocialAccount, automation: Automation, image_url: str | None) -> tuple[bool, str | None, str | None]:
+    if automation.dry_run:
+        log.info(f"[{automation.client_slug}] [DRY RUN] Twitter:\n{text}\n")
+        return True, None, None
+
+    creds = sa.credentials
+    needed = ["api_key", "api_secret", "access_token", "access_secret"]
+    missing = [k for k in needed if not creds.get(k)]
+    if missing:
+        return False, None, f"missing twitter credentials: {missing}"
 
     try:
         client = tweepy.Client(
-            consumer_key=TWITTER_API_KEY,
-            consumer_secret=TWITTER_API_SECRET,
-            access_token=TWITTER_ACCESS_TOKEN,
-            access_token_secret=TWITTER_ACCESS_SECRET,
+            consumer_key       =creds["api_key"],
+            consumer_secret    =creds["api_secret"],
+            access_token       =creds["access_token"],
+            access_token_secret=creds["access_secret"],
         )
         response = client.create_tweet(text=text)
-        log.info(f"✅ Posted to Twitter. Tweet ID: {response.data['id']}")
-        return True
-
+        tweet_id = response.data["id"]
+        log.info(f"[{automation.client_slug}] Posted to Twitter ({tweet_id}).")
+        return True, str(tweet_id), None
     except tweepy.errors.TweepyException as e:
-        log.error(f"Twitter post failed: {e}")
-        return False
+        return False, None, str(e)
 
 
-def post_to_linkedin(text: str) -> bool:
-    """Posts to LinkedIn using the REST API."""
-    if DRY_RUN:
-        log.info(f"[DRY RUN] LinkedIn post:\n{text}\n")
-        return True
+def post_to_linkedin(text: str, sa: SocialAccount, automation: Automation, image_url: str | None) -> tuple[bool, str | None, str | None]:
+    if automation.dry_run:
+        log.info(f"[{automation.client_slug}] [DRY RUN] LinkedIn:\n{text}\n")
+        return True, None, None
 
-    url = "https://api.linkedin.com/v2/ugcPosts"
+    access_token = sa.credentials.get("access_token")
+    person_urn   = (sa.metadata or {}).get("person_urn")
+    if not access_token or not person_urn:
+        return False, None, "missing LinkedIn access_token or person_urn"
+
     headers = {
-        "Authorization": f"Bearer {LINKEDIN_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
-        "X-Restli-Protocol-Version": "2.0.0"
+        "X-Restli-Protocol-Version": "2.0.0",
     }
     payload = {
-        "author": LINKEDIN_PERSON_URN,
+        "author": person_urn,
         "lifecycleState": "PUBLISHED",
         "specificContent": {
             "com.linkedin.ugc.ShareContent": {
                 "shareCommentary": {"text": text},
-                "shareMediaCategory": "NONE"
+                "shareMediaCategory": "NONE",
             }
         },
-        "visibility": {
-            "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
-        }
+        "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
     }
-
     try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        log.info(f"✅ Posted to LinkedIn.")
-        return True
-
+        r = requests.post("https://api.linkedin.com/v2/ugcPosts", headers=headers, json=payload)
+        r.raise_for_status()
+        urn = r.headers.get("x-restli-id")
+        log.info(f"[{automation.client_slug}] Posted to LinkedIn ({urn or 'no urn'}).")
+        return True, urn, None
     except requests.HTTPError as e:
-        log.error(f"LinkedIn post failed: {e} — {response.text}")
-        return False
+        return False, None, f"{e} — {r.text if 'r' in locals() else ''}"
+    except Exception as e:
+        return False, None, str(e)
 
 
-def post_to_instagram(text: str, image_url: str = None) -> bool:
-    """
-    Posts to Instagram via the Meta Graph API.
-    Requires a public image URL — Instagram does not support text-only posts.
-    Falls back to a default news graphic if no image is provided.
-    """
-    if DRY_RUN:
-        log.info(f"[DRY RUN] Instagram post:\n{text}\n")
-        return True
+def post_to_instagram(text: str, sa: SocialAccount, automation: Automation, image_url: str | None) -> tuple[bool, str | None, str | None]:
+    if automation.dry_run:
+        log.info(f"[{automation.client_slug}] [DRY RUN] Instagram ({sa.mode}):\n{text}\n")
+        return True, None, None
 
-    # Instagram requires an image — use article image or a default placeholder
-    media_url = image_url or "https://via.placeholder.com/1080x1080.png?text=World+News"
+    if sa.mode == "unofficial":
+        return _post_instagram_unofficial(text, sa, automation, image_url)
+    return _post_instagram_official(text, sa, automation, image_url)
 
-    # Step 1: Create media container
-    create_url = f"https://graph.facebook.com/v18.0/{INSTAGRAM_ACCOUNT_ID}/media"
-    create_params = {
-        "image_url": media_url,
-        "caption": text,
-        "access_token": INSTAGRAM_ACCESS_TOKEN
-    }
+
+def _post_instagram_official(text: str, sa: SocialAccount, automation: Automation, image_url: str | None) -> tuple[bool, str | None, str | None]:
+    access_token = sa.credentials.get("access_token")
+    account_id   = (sa.metadata or {}).get("account_id")
+    if not access_token or not account_id:
+        return False, None, "missing instagram access_token or account_id"
+
+    media_url = image_url or (automation.config.fallback_image_url if automation.config else None)
+    if not media_url:
+        return False, None, "no image_url and no fallback_image_url configured"
 
     try:
-        create_response = requests.post(create_url, params=create_params)
-        create_response.raise_for_status()
-        creation_id = create_response.json().get("id")
-
+        create_url = f"https://graph.facebook.com/v18.0/{account_id}/media"
+        cr = requests.post(create_url, params={
+            "image_url":    media_url,
+            "caption":      text,
+            "access_token": access_token,
+        })
+        cr.raise_for_status()
+        creation_id = cr.json().get("id")
         if not creation_id:
-            log.error("Instagram: No creation ID returned.")
-            return False
+            return False, None, "no creation id from instagram /media"
 
-        # Step 2: Publish the container
-        publish_url = f"https://graph.facebook.com/v18.0/{INSTAGRAM_ACCOUNT_ID}/media_publish"
-        publish_params = {
-            "creation_id": creation_id,
-            "access_token": INSTAGRAM_ACCESS_TOKEN
-        }
-        publish_response = requests.post(publish_url, params=publish_params)
-        publish_response.raise_for_status()
-
-        log.info(f"✅ Posted to Instagram.")
-        return True
-
+        publish_url = f"https://graph.facebook.com/v18.0/{account_id}/media_publish"
+        pr = requests.post(publish_url, params={
+            "creation_id":  creation_id,
+            "access_token": access_token,
+        })
+        pr.raise_for_status()
+        media_id = pr.json().get("id")
+        log.info(f"[{automation.client_slug}] Posted to Instagram (official, {media_id}).")
+        return True, str(media_id) if media_id else None, None
     except requests.HTTPError as e:
-        log.error(f"Instagram post failed: {e}")
-        return False
+        body = e.response.text if e.response is not None else ""
+        return False, None, f"{e} — {body}"
+    except Exception as e:
+        return False, None, str(e)
 
 
-# ─── Main Job ─────────────────────────────────────────────────────────────────
-
-def run_posting_job():
-    """
-    The main job: fetch one article, generate posts for each platform, and publish.
-    """
-    log.info("─── Running posting job ───")
-
-    articles = fetch_top_news(max_articles=15)
-    if not articles:
-        log.warning("No articles available. Skipping this run.")
-        return
-
-    # Pick a random unused article
-    article = random.choice(articles)
-    ALREADY_POSTED.add(article["url"])
-    save_posted_url(article["url"])
-
-    article_image = article.get("urlToImage")
-
-    # Only include platforms whose credentials are fully configured
-    all_platforms = {
-        "twitter":   (post_to_twitter,   ["TWITTER_API_KEY", "TWITTER_API_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_SECRET"]),
-        "linkedin":  (post_to_linkedin,  ["LINKEDIN_ACCESS_TOKEN", "LINKEDIN_PERSON_URN"]),
-        "instagram": (lambda text: post_to_instagram(text, image_url=article_image), ["INSTAGRAM_ACCESS_TOKEN", "INSTAGRAM_ACCOUNT_ID"]),
-    }
-
-    platforms = {
-        name: fn for name, (fn, keys) in all_platforms.items()
-        if is_configured(*keys)
-    }
-
-    skipped = set(all_platforms.keys()) - set(platforms.keys())
-    if skipped:
-        log.info(f"Skipping unconfigured platforms: {', '.join(skipped)}")
-
-    for platform, post_fn in platforms.items():
-        post_text = generate_post(article, platform)
-        if post_text:
-            success = post_fn(post_text)
-            if not success:
-                log.warning(f"Failed to post to {platform} — will retry next cycle.")
-        time.sleep(2)  # Brief pause between platform posts
-
-    log.info(f"─── Job complete. Article: {article['title'][:80]} ───\n")
+# Per-account cached instagrapi clients keyed by social_account_id.
+_IG_CLIENTS: dict[int, object] = {}
 
 
-# ─── Health Check ─────────────────────────────────────────────────────────────
+def _post_instagram_unofficial(text: str, sa: SocialAccount, automation: Automation, image_url: str | None) -> tuple[bool, str | None, str | None]:
+    try:
+        import httpx
+        from instagrapi import Client
+        from instagrapi.exceptions import LoginRequired
 
-def run_health_check():
-    """
-    Verifies all configured API connections are live before the scheduler starts.
-    Prints a clear pass/fail for each platform.
-    """
+        username      = (sa.metadata or {}).get("username") or sa.handle
+        password      = sa.credentials.get("password")
+        session_file  = (sa.metadata or {}).get("session_file") or f"ig_session_{sa.id}.json"
+        proxy         = (sa.metadata or {}).get("proxy")
+        if not username or not password:
+            return False, None, "missing instagram username or password"
+
+        cl = _IG_CLIENTS.get(sa.id)
+        if cl is None:
+            cl = Client()
+            cl.delay_range = [2, 5]
+            if proxy:
+                cl.set_proxy(proxy)
+
+            session_path = Path(session_file)
+            if session_path.exists():
+                try:
+                    cl.load_settings(session_path)
+                    cl.login(username, password)
+                    cl.get_timeline_feed()  # cheap session-validity check
+                    log.info(f"[{automation.client_slug}] Instagram: reused session {session_path}")
+                except LoginRequired:
+                    log.warning(f"[{automation.client_slug}] Instagram: session expired, fresh login.")
+                    cl = Client()
+                    cl.delay_range = [2, 5]
+                    if proxy:
+                        cl.set_proxy(proxy)
+                    cl.login(username, password)
+                    cl.dump_settings(session_path)
+            else:
+                cl.login(username, password)
+                cl.dump_settings(session_path)
+                log.info(f"[{automation.client_slug}] Instagram: fresh login, saved {session_path}")
+
+            _IG_CLIENTS[sa.id] = cl
+
+        media_url = image_url or (automation.config.fallback_image_url if automation.config else None)
+        if not media_url:
+            return False, None, "no image_url and no fallback_image_url configured"
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            img_data = httpx.get(media_url, timeout=30).content
+            tmp.write(img_data)
+            tmp_path = Path(tmp.name)
+
+        media = cl.photo_upload(tmp_path, caption=text)
+        tmp_path.unlink(missing_ok=True)
+
+        log.info(f"[{automation.client_slug}] Posted to Instagram (unofficial, {getattr(media, 'pk', '?')}).")
+        return True, str(getattr(media, "pk", "")), None
+    except Exception as e:
+        # Drop cached client so the next attempt re-validates.
+        _IG_CLIENTS.pop(sa.id, None)
+        return False, None, str(e)
+
+
+POSTERS = {
+    "twitter":   post_to_twitter,
+    "linkedin":  post_to_linkedin,
+    "instagram": post_to_instagram,
+}
+
+
+# ─── Main posting job ────────────────────────────────────────────────────────
+
+def run_posting_job(automation: Automation, trigger: str = "scheduled") -> None:
+    """Run one full cycle for one automation."""
+    log.info(f"─── [{automation.client_slug}] {automation.name} — running ───")
+
+    run_id = create_run(automation.id, automation.client_id, trigger_source=trigger)
+
+    try:
+        articles = fetch_top_news(automation)
+        if not articles:
+            log.warning(f"[{automation.client_slug}] No articles available, skipping.")
+            finalise_run(run_id, status="failed", articles_considered=0,
+                         notes="no candidate articles after filters")
+            return
+
+        # Pick the freshest available article (newsapi orders by recency).
+        chosen = articles[0]
+        article_id = upsert_article(
+            automation_id=automation.id,
+            client_id=automation.client_id,
+            article=chosen,
+            selection_status="chosen",
+        )
+
+        any_success = False
+        any_failure = False
+
+        for sa in automation.social_accounts:
+            poster = POSTERS.get(sa.platform)
+            if poster is None:
+                log.warning(f"[{automation.client_slug}] No poster for {sa.platform}, skipping.")
+                continue
+
+            text = generate_post(chosen, sa.platform, automation)
+            if text is None:
+                record_post(automation.id, automation.client_id, article_id,
+                            sa.platform, "failed", "",
+                            error_message="AI generation returned None")
+                any_failure = True
+                continue
+
+            ok, external_id, err = poster(text, sa, automation, chosen.get("urlToImage"))
+
+            record_post(
+                automation_id=automation.id,
+                client_id=automation.client_id,
+                article_id=article_id,
+                platform=sa.platform,
+                status="published" if ok else "failed",
+                generated_text=text,
+                external_id=external_id,
+                error_message=err,
+            )
+
+            if ok:
+                any_success = True
+            else:
+                any_failure = True
+                log.warning(f"[{automation.client_slug}] {sa.platform} failed: {err}")
+
+            time.sleep(2)  # gentle pacing between platforms
+
+        status = "success" if any_success and not any_failure else \
+                 "partial" if any_success else "failed"
+        finalise_run(run_id, status=status,
+                     articles_considered=len(articles),
+                     article_id_chosen=article_id)
+        log.info(f"─── [{automation.client_slug}] Job complete ({status}) — "
+                 f"{(chosen.get('title') or '')[:80]} ───\n")
+
+    except Exception as e:
+        log.exception(f"[{automation.client_slug}] Run crashed: {e}")
+        finalise_run(run_id, status="failed", notes=str(e))
+        db_log("error", f"Run crashed: {e}",
+               run_id=run_id, automation_id=automation.id,
+               client_id=automation.client_id)
+
+
+# ─── Health check ────────────────────────────────────────────────────────────
+
+def run_health_check(automations: list[Automation]) -> bool:
     log.info("════════════════════════════════════════")
-    log.info("  HEALTH CHECK — verifying connections")
+    log.info("  HEALTH CHECK")
     log.info("════════════════════════════════════════")
     all_ok = True
 
     # NewsAPI
     try:
-        newsapi = NewsApiClient(api_key=NEWS_API_KEY)
-        result = newsapi.get_top_headlines(sources="bbc-news", page_size=1)
-        if result.get("articles"):
-            log.info("  ✅  NewsAPI          — connected")
-        else:
-            raise ValueError("No articles returned")
+        NewsApiClient(api_key=NEWS_API_KEY).get_top_headlines(sources="bbc-news", page_size=1)
+        log.info("  [ok]  NewsAPI")
     except Exception as e:
-        log.error(f"  ❌  NewsAPI          — FAILED: {e}")
+        log.error(f"  [FAIL] NewsAPI: {e}")
         all_ok = False
 
     # Anthropic
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=10,
-            messages=[{"role": "user", "content": "ping"}]
+        anthropic.Anthropic(api_key=ANTHROPIC_API_KEY).messages.create(
+            model=AI_MODEL, max_tokens=10,
+            messages=[{"role": "user", "content": "ping"}],
         )
-        log.info("  ✅  Anthropic (Claude) — connected")
+        log.info("  [ok]  Anthropic")
     except Exception as e:
-        log.error(f"  ❌  Anthropic (Claude) — FAILED: {e}")
+        log.error(f"  [FAIL] Anthropic: {e}")
         all_ok = False
 
-    # Twitter
-    if is_configured("TWITTER_API_KEY", "TWITTER_API_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_SECRET"):
-        try:
-            client = tweepy.Client(
-                consumer_key=TWITTER_API_KEY,
-                consumer_secret=TWITTER_API_SECRET,
-                access_token=TWITTER_ACCESS_TOKEN,
-                access_token_secret=TWITTER_ACCESS_SECRET,
-            )
-            client.get_me()
-            log.info("  ✅  Twitter/X        — connected")
-        except Exception as e:
-            log.error(f"  ❌  Twitter/X        — FAILED: {e}")
-            all_ok = False
-    else:
-        log.info("  ⏭️   Twitter/X        — skipped (not configured)")
+    # Per-automation summary
+    if not automations:
+        log.warning("  No active automations loaded from DB — nothing to schedule.")
+        all_ok = False
+    for a in automations:
+        log.info(f"  [{a.client_slug}] {a.name}  tz={a.timezone}  dry_run={a.dry_run}  "
+                 f"times={a.schedule_times}  platforms={[s.platform for s in a.social_accounts]}")
 
-    # LinkedIn
-    if is_configured("LINKEDIN_ACCESS_TOKEN", "LINKEDIN_PERSON_URN"):
-        try:
-            response = requests.get(
-                "https://api.linkedin.com/v2/me",
-                headers={"Authorization": f"Bearer {LINKEDIN_ACCESS_TOKEN}"}
-            )
-            response.raise_for_status()
-            name = response.json().get("localizedFirstName", "unknown")
-            log.info(f"  ✅  LinkedIn         — connected (as {name})")
-        except Exception as e:
-            log.error(f"  ❌  LinkedIn         — FAILED: {e}")
-            all_ok = False
-    else:
-        log.info("  ⏭️   LinkedIn         — skipped (not configured)")
-
-    # Instagram
-    if is_configured("INSTAGRAM_ACCESS_TOKEN", "INSTAGRAM_ACCOUNT_ID"):
-        try:
-            response = requests.get(
-                f"https://graph.facebook.com/v18.0/{INSTAGRAM_ACCOUNT_ID}",
-                params={"fields": "username", "access_token": INSTAGRAM_ACCESS_TOKEN}
-            )
-            response.raise_for_status()
-            username = response.json().get("username", "unknown")
-            log.info(f"  ✅  Instagram        — connected (@{username})")
-        except Exception as e:
-            log.error(f"  ❌  Instagram        — FAILED: {e}")
-            all_ok = False
-    else:
-        log.info("  ⏭️   Instagram        — skipped (not configured)")
-
-    log.info("════════════════════════════════════════")
-    if all_ok:
-        log.info("  All systems operational. Starting scheduler.")
-    else:
-        log.warning("  One or more connections failed. Check errors above.")
     log.info("════════════════════════════════════════\n")
     return all_ok
 
 
-# ─── Scheduler ────────────────────────────────────────────────────────────────
+# ─── Scheduler (timezone-aware, multi-automation) ────────────────────────────
 
-def start_scheduler():
+def schedule_loop(automations: list[Automation]) -> None:
     """
-    Runs a health check, then schedules the posting job 3 times per day:
-    8am, 1pm, and 6pm (local time).
+    Polling scheduler. Every 30s, for each automation check whether the current
+    time-of-day in that automation's timezone matches one of its schedule_times,
+    and if it hasn't already fired today, run it.
     """
-    run_health_check()
-
-    schedule.every().day.at("08:00").do(run_posting_job)
-    schedule.every().day.at("13:00").do(run_posting_job)
-    schedule.every().day.at("18:00").do(run_posting_job)
-
-    log.info(f"Scheduler active. Next posts at 08:00, 13:00, 18:00 daily.")
-    log.info(f"DRY_RUN mode: {'ON ⚠️' if DRY_RUN else 'OFF — posts are live'}\n")
+    last_fired: dict[tuple[int, str], str] = defaultdict(str)
+    log.info("Scheduler started. Ctrl-C to stop.\n")
 
     while True:
-        schedule.run_pending()
-        time.sleep(30)
+        try:
+            for a in automations:
+                try:
+                    tz = ZoneInfo(a.timezone)
+                except Exception:
+                    log.error(f"[{a.client_slug}] Invalid timezone {a.timezone!r} — skipping.")
+                    continue
+                now_local = datetime.now(tz)
+                current_hm = now_local.strftime("%H:%M")
+                today = now_local.date().isoformat()
+                for sched_time in a.schedule_times:
+                    if current_hm == sched_time and last_fired[(a.id, sched_time)] != today:
+                        last_fired[(a.id, sched_time)] = today
+                        run_posting_job(a, trigger="scheduled")
+            time.sleep(30)
+        except KeyboardInterrupt:
+            log.info("Scheduler stopped by user.")
+            return
+        except Exception as e:
+            log.exception(f"Scheduler loop error: {e}")
+            time.sleep(30)
 
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
+# ─── Entry point ─────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    import sys
+def main() -> None:
+    automations = load_active_automations(type_filter="news_posting")
+    ok = run_health_check(automations)
 
     if len(sys.argv) > 1 and sys.argv[1] == "--run-now":
-        # Useful for testing: run one job immediately
-        log.info("Running one posting job immediately (--run-now flag detected).")
-        run_posting_job()
-    else:
-        start_scheduler()
+        target_slug = sys.argv[2] if len(sys.argv) > 2 else None
+        targets = [a for a in automations if (target_slug is None or a.client_slug == target_slug)]
+        if not targets:
+            log.error(f"No active news_posting automation found"
+                      f"{f' for client {target_slug}' if target_slug else ''}.")
+            sys.exit(1)
+        for a in targets:
+            run_posting_job(a, trigger="manual")
+        return
+
+    if not ok:
+        log.warning("Health check failed; scheduler starting anyway.")
+    schedule_loop(automations)
+
+
+if __name__ == "__main__":
+    main()

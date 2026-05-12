@@ -1,0 +1,31 @@
+; -----------------------------------------------------------------------------
+; teventis-telephony.service — Riley AI phone agent (FastAPI webhook server)
+; -----------------------------------------------------------------------------
+; Install:
+;   sudo cp teventis-telephony.service /etc/systemd/system/
+;   sudo systemctl daemon-reload
+;   sudo systemctl enable teventis-telephony
+;   sudo systemctl start teventis-telephony
+;
+; Uses the same venv + working directory as the news-automation service so
+; both share /opt/teventis-automations and a single deploy step. The deploy
+; pipeline (.github/workflows/deploy.yml) restarts BOTH services after a push.
+; -----------------------------------------------------------------------------
+
+[Unit]
+Description=Teventis Telephony — Riley AI phone agent (Vapi webhooks)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/teventis-automations
+EnvironmentFile=/opt/teventis-automations/.env
+ExecStart=/opt/teventis-automations/venv/bin/python /opt/teventis-automations/telephony-appointments/server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/teventis-telephony.log
+StandardError=append:/var/log/teventis-telephony.log
+
+[Install]
+WantedBy=multi-user.target
